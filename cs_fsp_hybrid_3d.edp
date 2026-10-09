@@ -1,0 +1,699 @@
+// ============================================================
+// HYBRID COLD SPRAY + FRICTION STIR PROCESSING (CS + FSP)
+// 3D CEL-type Eulerian model  |  FreeFEM++
+//
+// SEQUENCE
+//   Stage A  COLD SPRAY : nozzle rasters over a Cu substrate and
+//                         builds an Al (or Al+Cu powder) coating
+//   Stage B  DWELL      : coating cools before FSP starts
+//   Stage C  FSP        : PLUNGE -> TRAVERSE -> LIFT through the
+//                         as-sprayed coating into the Cu substrate
+//
+// IDEA
+//   One fixed mesh that contains the Cu substrate PLUS an air/void
+//   layer above it. Cold spray "fills" the void from below by
+//   raising a deposit height field hdep(x,y). FSP then stirs the
+//   material with a penalised (Brinkman) rotating tool.
+//
+// FIELDS (P1)
+//   alpha  : solid fraction            1 = metal, 0 = void/air
+//   phi    : Al fraction of the solid  1 = Al,    0 = Cu
+//   poro   : porosity (as-sprayed poro0, closed by FSP strain)
+//   epsAcc : accumulated plastic strain during FSP
+//   hdep   : as-sprayed coating thickness h(x,y)
+// ============================================================
+
+load "iovtk"
+
+string outdir = "D:\\freefem++\\cs_fsp_3d\\";
+system("mkdir \"D:\\freefem++\\cs_fsp_3d\"");
+
+// ============================================================
+// GEOMETRY
+// ============================================================
+real Lx    = 0.100;    // plate half-length X [m] -> 200 mm
+real Ly    = 0.030;    // plate half-width  Y [m] ->  60 mm
+real HzCu  = 0.002;    // Cu substrate thickness [m]
+real Hvoid = 0.0035;   // air layer above substrate (coating grows into it)
+real Hdom  = HzCu + Hvoid;
+
+// FSP tool
+real Rsh       = 0.010;    // shoulder radius
+real Rpin      = 0.003;    // pin radius
+real dPinSub   = 0.5e-3;   // pin tip penetration into Cu substrate
+real dShPlunge = 0.1e-3;   // shoulder plunge below coating surface
+real Lpin      = 0.0025;   // re-computed after CS from real coating thickness
+
+real xStart = -Lx + Rsh + 0.005;
+real xEnd   =  Lx - Rsh - 0.005;
+
+// ============================================================
+// COLD SPRAY PARAMETERS (N2, Al powder on Cu)
+// ============================================================
+real fAlPow   = 1.0;      // Al volume fraction in powder (1 = pure Al, 0.7 = Al+30%Cu blend)
+real mdotPow  = 3.3e-4;   // powder feed rate [kg/s]  (~20 g/min)
+real DE       = 0.70;     // deposition efficiency
+real vPart    = 650.;     // particle impact velocity [m/s]
+real Tpart    = 400.;     // particle temperature at impact [K]
+real etaKE    = 0.9;      // fraction of impact KE converted to heat
+real TgasJet  = 623.;     // process gas temperature at nozzle exit [K]
+real hJet0    = 1500.;    // peak jet impingement HTC [W/m2K]
+real sigSpot  = 0.003;    // Gaussian radius of spray footprint [m]
+real standoff = 0.020;    // nozzle stand-off (visualisation only) [m]
+real vNoz     = 0.05;     // nozzle traverse speed [m/s]
+real hatch    = 0.003;    // raster pass spacing [m]
+real Wband    = 0.030;    // coated band width [m]  (> 2*Rsh)
+int  Nlayer   = 4;        // raster layers
+int  NsubCS   = 6;        // time sub-steps per pass
+real poro0    = 0.03;     // as-sprayed porosity
+
+real xCSa  = -Lx + 0.005;
+real xCSb  =  Lx - 0.005;
+int  Npass = int(Wband/hatch) + 1;
+real tPass = (xCSb - xCSa)/vNoz;
+real dtCS  = tPass/NsubCS;
+real Lseg  = vNoz*dtCS;
+real tCS   = Nlayer*Npass*tPass;
+
+real tDwell      = 20.;   // pause between CS and FSP [s]
+int  NstepDwell  = 4;
+
+// ============================================================
+// FSP PARAMETERS
+// ============================================================
+real omegaTool = 1200.*2.*pi/60.;
+real vPlunge   = 1.0e-3;
+real vFeed     = 1.5e-3;
+real vLift     = 2.0e-3;
+real muFric    = 0.35;
+real deltaFric = 0.4;
+real sigmaNnom = 40.e6;   // nominal contact pressure (~10 kN on a 20 mm shoulder)
+
+int  NstepFSP = 200;
+int  Nsave    = 10;
+
+// ============================================================
+// MATERIALS
+// ============================================================
+real rhoAl = 2710., CpAl = 900., kAl = 222., TmAl = 916.;
+real rhoCu = 8960., CpCu = 385., kCu = 401., TmCu = 1358.;
+real Tmelt = TmAl;
+real Tamb  = 293.;
+real Tinit = Tamb;
+
+// numerical "air" in the void (kept moderate for conditioning)
+real rhoVoid   = 10.;
+real rhoCpVoid = 1.2e3;
+real kVoid     = 0.026;
+
+real rhoCoat = fAlPow*rhoAl + (1.-fAlPow)*rhoCu;
+real CpCoat  = (fAlPow*rhoAl*CpAl + (1.-fAlPow)*rhoCu*CpCu)/rhoCoat;
+
+// Norton-Hoff consistency: K decreases with T (softening)
+real K0Al = 1.5e8;
+real K0Cu = 3.5e8;
+real mNh  = 0.18;
+real Qnh  = 1.2e4;
+real Rgas = 8.314;
+real Tref = 293.;
+
+func real Kmat(real T, real ph) {
+    real fac = exp(Qnh/Rgas*(1./max(T,300.) - 1./Tref));
+    return (ph*K0Al + (1.-ph)*K0Cu)*fac;
+}
+
+real epsReg  = 1.e-3;
+real etaMin  = 1.e3;
+real etaMax  = 1.e9;
+real etaVoid = etaMin;
+
+real Cden = 1.0;      // porosity closure rate per unit strain
+real Dart = 1.e-7;    // small artificial diffusion for scalar advection [m2/s]
+
+macro strainRateMag(ux,uy,uz)  sqrt(
+     dx(ux)^2 + dy(uy)^2 + dz(uz)^2
+   + 0.5*(dy(ux)+dx(uy))^2
+   + 0.5*(dz(ux)+dx(uz))^2
+   + 0.5*(dz(uy)+dy(uz))^2
+   + epsReg^2)
+// EOM
+
+// ============================================================
+// MESH  (substrate + void layer, y clustered towards the track)
+// ============================================================
+int Nx = 24;
+int Ny = 12;
+int Nz = 11;
+
+mesh3 ThCube = cube(Nx, Ny, Nz);
+mesh3 Th = movemesh3(ThCube,
+    transfo=[ Lx*(2.*x - 1.),
+              Ly*(0.5*(2.*y-1.) + 0.5*(2.*y-1.)^3),
+              Hdom*z ]);
+
+// explicit face labels (do not rely on cube() defaults)
+//   1 z=0 anvil | 2 z=Hdom top of void | 3/4 y=-Ly/+Ly | 5/6 x=-Lx/+Lx
+real tolB = 1.e-7;
+Th = change(Th, flabel = 1*(z < tolB) + 2*(z > Hdom - tolB)
+                       + 3*(y < -Ly + tolB) + 4*(y > Ly - tolB)
+                       + 5*(x < -Lx + tolB) + 6*(x > Lx - tolB));
+
+real dzS  = Hdom/Nz;
+real hx   = 2.*Lx/Nx;
+real hyC  = 0.5*2.*Ly/Ny;
+real hmin = min(min(hx, hyC), dzS);
+real drS  = 0.6*hx;               // radial band for pin heat
+real Rpen = max(Rpin, 0.55*hx);   // pin penalisation radius (>= mesh size)
+real lamPen = 1.e2*etaMax/hmin^2;
+
+cout << "==========================================" << endl;
+cout << " HYBRID COLD SPRAY + FSP  (Al on Cu)" << endl;
+cout << " Mesh: " << Th.nv << " nodes  " << Th.nt << " tets" << endl;
+cout << " CS: " << Nlayer << " layers x " << Npass << " passes, tCS="
+     << tCS << " s" << endl;
+cout << " Expected coating ~ "
+     << Nlayer*DE*mdotPow/(rhoCoat*(1.-poro0)*vNoz*hatch)*1000. << " mm" << endl;
+cout << "==========================================" << endl;
+
+// ============================================================
+// FE SPACES
+// ============================================================
+fespace Xh(Th, [P1b, P1b, P1b, P1]);
+fespace Sh(Th, P1);
+
+Xh [ux, uy, uz, p];
+Xh [vx, vy, vz, q];
+Xh [ux0, uy0, uz0, p0];
+
+Sh Temp, Temp0, Tsource;
+Sh alpha, aOld, phi, poro, epsAcc, hdep, zs;
+Sh gJet, sband, hJv;
+Sh etaEff, rhoMix, rhoCpMix, kMix;
+Sh chiT, uxT, uyT, uzT;
+Sh edotF, cOld, shW, pinW;
+
+macro UPDATEPROPS(a, ph, po)
+    rhoMix   = a*(ph*rhoAl + (1.-ph)*rhoCu) + (1.-a)*rhoVoid;
+    rhoCpMix = a*(1.-po)*(ph*rhoAl*CpAl + (1.-ph)*rhoCu*CpCu) + (1.-a)*rhoCpVoid;
+    kMix     = a*(1.-1.5*po)*(ph*kAl + (1.-ph)*kCu) + (1.-a)*kVoid;
+// EOM
+
+// ============================================================
+// INITIAL STATE: bare Cu substrate, empty void above
+// ============================================================
+hdep   = 0.;
+zs     = HzCu + hdep;
+alpha  = min(1., max(0., (zs - z)/dzS + 1.));
+phi    = fAlPow*(z > HzCu + 1.e-9);      // anything deposited above Cu has powder composition
+poro   = poro0*(z > HzCu + 1.e-9);
+epsAcc = 0.;
+Temp   = Tinit;
+Temp0  = Tinit;
+ux[]   = 0.;
+ux0[]  = 0.;
+etaEff = etaMax;
+Tsource = 0.;  hJv = 0.;
+chiT = 0.; uxT = 0.; uyT = 0.; uzT = 0.;
+UPDATEPROPS(alpha, phi, poro)
+
+// ============================================================
+// VARIATIONAL FORMS
+// ============================================================
+real dt     = 1.;
+real epsP   = 1.e-6;
+real thetaT = 0.5;
+real hAnvil = 300.;
+real hAir   = 10.;
+
+// Stokes + Brinkman penalisation of the rotating tool
+varf aStokes([ux,uy,uz,p],[vx,vy,vz,q]) =
+    int3d(Th)(
+        2.*etaEff*(
+            dx(ux)*dx(vx)+dy(ux)*dy(vx)+dz(ux)*dz(vx)
+          + dx(uy)*dx(vy)+dy(uy)*dy(vy)+dz(uy)*dz(vy)
+          + dx(uz)*dx(vz)+dy(uz)*dy(vz)+dz(uz)*dz(vz)
+          + 0.5*(dy(ux)+dx(uy))*(dy(vx)+dx(vy))
+          + 0.5*(dz(ux)+dx(uz))*(dz(vx)+dx(vz))
+          + 0.5*(dz(uy)+dy(uz))*(dz(vy)+dy(vz))
+        )
+        - p*(dx(vx)+dy(vy)+dz(vz))
+        + q*(dx(ux)+dy(uy)+dz(uz))
+        + epsP*p*q
+        + rhoMix/dt*(ux*vx+uy*vy+uz*vz)
+        + lamPen*chiT*(ux*vx+uy*vy+uz*vz)
+    )
+    + on(1,3,4,5,6, ux=0., uy=0., uz=0.)     // clamped plate on anvil
+    ;
+
+varf lStokes([ux,uy,uz,p],[vx,vy,vz,q]) =
+    int3d(Th)(
+        rhoMix/dt*(ux0*vx+uy0*vy+uz0*vz)
+      - rhoMix*(
+            (ux0*dx(ux0)+uy0*dy(ux0)+uz0*dz(ux0))*vx
+          + (ux0*dx(uy0)+uy0*dy(uy0)+uz0*dz(uy0))*vy
+          + (ux0*dx(uz0)+uy0*dy(uz0)+uz0*dz(uz0))*vz
+        )
+      + lamPen*chiT*(uxT*vx+uyT*vy+uzT*vz)
+    )
+    + on(1,3,4,5,6, ux=0., uy=0., uz=0.)
+    ;
+
+// Heat: mixed Al/Cu/void properties + CS gas-jet Robin term (hJv)
+varf aTh(Temp,dTemp) =
+    int3d(Th)(
+        rhoCpMix/dt*Temp*dTemp
+      + thetaT*kMix*(dx(Temp)*dx(dTemp)+dy(Temp)*dy(dTemp)+dz(Temp)*dz(dTemp))
+      + thetaT*rhoCpMix*(ux*dx(Temp)+uy*dy(Temp)+uz*dz(Temp))*dTemp
+      + hJv*Temp*dTemp
+    )
+    + int2d(Th,1)( hAnvil*Temp*dTemp )
+    + int2d(Th,2,3,4,5,6)( hAir*Temp*dTemp )
+    ;
+
+varf lTh(Temp,dTemp) =
+    int3d(Th)(
+        rhoCpMix/dt*Temp0*dTemp
+      - (1.-thetaT)*kMix*(dx(Temp0)*dx(dTemp)+dy(Temp0)*dy(dTemp)+dz(Temp0)*dz(dTemp))
+      - (1.-thetaT)*rhoCpMix*(ux0*dx(Temp0)+uy0*dy(Temp0)+uz0*dz(Temp0))*dTemp
+      + Tsource*dTemp
+      + hJv*TgasJet*dTemp
+    )
+    + int2d(Th,1)( hAnvil*Tamb*dTemp )
+    + int2d(Th,2,3,4,5,6)( hAir*Tamb*dTemp )
+    ;
+
+// Scalar advection (alpha, phi, poro, epsAcc share one matrix)
+varf aAdv(c,dc) =
+    int3d(Th)(
+        c*dc/dt
+      + (ux*dx(c)+uy*dy(c)+uz*dz(c))*dc
+      + Dart*(dx(c)*dx(dc)+dy(c)*dy(dc)+dz(c)*dz(dc))
+    );
+varf lAdv(c,dc) = int3d(Th)( cOld*dc/dt );
+
+macro ADVECT(f)
+{
+    cOld = f;
+    real[int] bA = lAdv(0,Sh);
+    f[] = MV^-1*bA;
+}
+// EOM
+
+// ============================================================
+// FSP KINEMATICS (local time tf from FSP start)
+// zTop, stroke and times are set after cold spray
+// ============================================================
+real zTop = HzCu + 0.002;
+real stroke = 0., tPlunge = 0., tTraverse = 0., tLift = 0., TtotFSP = 0.;
+
+func real xToolF(real tf) {
+    if (tf <= tPlunge) return xStart;
+    else if (tf <= tPlunge + tTraverse) return xStart + vFeed*(tf - tPlunge);
+    else return xEnd;
+}
+func real ztipF(real tf) {
+    if (tf <= tPlunge) return zTop - vPlunge*tf;
+    else if (tf <= tPlunge + tTraverse) return zTop - stroke;
+    else return zTop - stroke + vLift*(tf - tPlunge - tTraverse);
+}
+
+// ============================================================
+// VTU writer for tool / nozzle (shoulder-or-body cylinder + pin-or-plume)
+// ============================================================
+func int writeTool(string fname, real xc, real yc, real zsh, real ztip,
+                   real th0, real Rs, real Rp, real Hs)
+{
+    int Nc = 32, Nzp = 6;
+    int Nv     = 1 + 2*Nc + Nzp*Nc + 1;
+    int Ncells = 3*Nc + (Nzp-1)*Nc;
+    ofstream tv(fname);
+    tv << "<?xml version='1.0'?><VTKFile type='UnstructuredGrid' version='0.1'>"
+       << "<UnstructuredGrid><Piece NumberOfPoints='" << Nv
+       << "' NumberOfCells='" << Ncells << "'>" << endl;
+    tv << "<Points><DataArray type='Float64' NumberOfComponents='3' format='ascii'>" << endl;
+    tv << xc << " " << yc << " " << zsh+Hs << endl;
+    for (int ic=0; ic<Nc; ic++) {
+        real th = th0 + 2.*pi*ic/Nc;
+        tv << xc+Rs*cos(th) << " " << yc+Rs*sin(th) << " " << zsh+Hs << endl;
+    }
+    for (int ic=0; ic<Nc; ic++) {
+        real th = th0 + 2.*pi*ic/Nc;
+        tv << xc+Rs*cos(th) << " " << yc+Rs*sin(th) << " " << zsh << endl;
+    }
+    for (int iz=0; iz<Nzp; iz++) {
+        real zz = zsh - (zsh-ztip)*iz/(Nzp-1.);
+        for (int ic=0; ic<Nc; ic++) {
+            real th = th0 + 2.*pi*ic/Nc;
+            tv << xc+Rp*cos(th) << " " << yc+Rp*sin(th) << " " << zz << endl;
+        }
+    }
+    tv << xc << " " << yc << " " << ztip << endl;
+    tv << "</DataArray></Points><Cells>" << endl;
+
+    tv << "<DataArray type='Int64' Name='connectivity' format='ascii'>" << endl;
+    for (int ic=0; ic<Nc; ic++)
+        tv << 0 << " " << 1+ic << " " << 1+(ic+1)%Nc << endl;
+    for (int ic=0; ic<Nc; ic++)
+        tv << 1+ic << " " << 1+(ic+1)%Nc << " "
+           << Nc+1+(ic+1)%Nc << " " << Nc+1+ic << endl;
+    int pb = 2*Nc + 1;
+    for (int iz=0; iz<Nzp-1; iz++) {
+        int b0 = pb + iz*Nc, b1 = pb + (iz+1)*Nc;
+        for (int ic=0; ic<Nc; ic++)
+            tv << b0+ic << " " << b0+(ic+1)%Nc << " "
+               << b1+(ic+1)%Nc << " " << b1+ic << endl;
+    }
+    int lr = pb + (Nzp-1)*Nc, tp = Nv - 1;
+    for (int ic=0; ic<Nc; ic++)
+        tv << tp << " " << lr+ic << " " << lr+(ic+1)%Nc << endl;
+    tv << "</DataArray>" << endl;
+
+    tv << "<DataArray type='Int64' Name='offsets' format='ascii'>" << endl;
+    int off = 0;
+    for (int c=0; c<Nc; c++)          { off += 3; tv << off << endl; }
+    for (int c=0; c<Nc; c++)          { off += 4; tv << off << endl; }
+    for (int c=0; c<(Nzp-1)*Nc; c++)  { off += 4; tv << off << endl; }
+    for (int c=0; c<Nc; c++)          { off += 3; tv << off << endl; }
+    tv << "</DataArray>" << endl;
+    tv << "<DataArray type='UInt8' Name='types' format='ascii'>" << endl;
+    for (int c=0; c<Nc; c++)          tv << "5" << endl;
+    for (int c=0; c<Nc; c++)          tv << "9" << endl;
+    for (int c=0; c<(Nzp-1)*Nc; c++)  tv << "9" << endl;
+    for (int c=0; c<Nc; c++)          tv << "5" << endl;
+    tv << "</DataArray></Cells></Piece></UnstructuredGrid></VTKFile>" << endl;
+    return 0;
+}
+
+// ============================================================
+// OUTPUT
+// ============================================================
+{
+    ofstream fpvd(outdir+"fsam.pvd");
+    fpvd << "<?xml version='1.0'?>" << endl;
+    fpvd << "<VTKFile type='Collection' version='0.1'><Collection>" << endl;
+}
+{
+    ofstream fcsv(outdir+"fsam_data.csv");
+    fcsv << "time_s,phase,xNoz_mm,yNoz_mm,hCoat_centre_mm,xTool_mm,ztip_mm,"
+         << "Tmax_K,Tprobe_K,Fz_N,Torque_Nm,poroMean" << endl;
+}
+
+int[int] ordVTK = [1,1,1,1,1,1,1,1,1,1];
+int  frame = 0;
+real xToolNow, ztipNow, zshNow, thetaNow, vxTool, vzTool;
+real xNozNow, yNozNow, zNozNow;
+real xProbe, yProbe, zProbe;
+real FzNow = 0., TqNow = 0.;
+
+macro SAVEFRAME(tnow, lab)
+{
+    string num;
+    if      (frame<  10) num = "000"+frame;
+    else if (frame< 100) num = "00" +frame;
+    else if (frame<1000) num = "0"  +frame;
+    else                 num = ""   +frame;
+
+    savevtk(outdir+"fsam_"+num+".vtu", Th,
+        ux, uy, uz, Temp, phi, alpha, poro, epsAcc, hdep, etaEff,
+        dataname="Vx Vy Vz TempK AlFrac SolidFrac Porosity PlasticStrain CoatThick EtaEff",
+        order=ordVTK);
+
+    int dumT = writeTool(outdir+"tool_"+num+".vtu",
+                         xToolNow, 0., zshNow, ztipNow, thetaNow, Rsh, Rpin, 0.003);
+    int dumN = writeTool(outdir+"nozzle_"+num+".vtu",
+                         xNozNow, yNozNow, zNozNow, zNozNow-standoff, 0.,
+                         0.006, sigSpot, 0.030);
+    {
+        ofstream pv(outdir+"fsam.pvd", append);
+        pv << "  <DataSet timestep='" << tnow << "' part='0' file='fsam_"   << num << ".vtu'/>" << endl;
+        pv << "  <DataSet timestep='" << tnow << "' part='1' file='tool_"   << num << ".vtu'/>" << endl;
+        pv << "  <DataSet timestep='" << tnow << "' part='2' file='nozzle_" << num << ".vtu'/>" << endl;
+    }
+
+    real Tmax   = Temp[].max;
+    real xpS    = min(max(xProbe, -Lx+1.e-3), Lx-1.e-3);
+    real ypS    = min(max(yProbe, -Ly+1.e-3), Ly-1.e-3);
+    real zpS    = min(max(zProbe, 1.e-4), Hdom-1.e-4);
+    real Tprobe = Temp(xpS, ypS, zpS);
+    real hc0    = hdep(0., 0., HzCu);
+    real volC   = int3d(Th)(alpha*(z > HzCu+1.e-9));
+    real poroM  = int3d(Th)(poro*alpha*(z > HzCu+1.e-9))/max(volC, 1.e-15);
+    {
+        ofstream cv(outdir+"fsam_data.csv", append);
+        cv << tnow << "," << lab << "," << xNozNow*1000. << "," << yNozNow*1000. << ","
+           << hc0*1000. << "," << xToolNow*1000. << "," << ztipNow*1000. << ","
+           << Tmax << "," << Tprobe << "," << FzNow << "," << TqNow << ","
+           << poroM << endl;
+    }
+    cout << "t=" << tnow << "s [" << lab << "]  hCoat(0,0)=" << hc0*1000.
+         << "mm  Tmax=" << Tmax << "K  Tprobe=" << Tprobe
+         << "K  poro=" << poroM << endl;
+    frame++;
+}
+// EOM
+
+// ============================================================
+// STAGE A : COLD SPRAY DEPOSITION  (no flow, thermal only)
+//
+// Each sub-step the nozzle sweeps a segment [xa,xb] of length Lseg.
+// gJet = time-average of the Gaussian footprint over that segment
+// (exact via erf), so deposited mass is conserved for any dt.
+// ============================================================
+real tGlob = 0.;
+string phaseLabel = "INIT";
+
+real mdotVol = DE*mdotPow/(rhoCoat*(1.-poro0));          // deposited volume rate [m3/s]
+real PpartCS = etaKE*DE*mdotPow*0.5*vPart^2;             // impact KE -> heat [W]
+
+xToolNow = xStart; zshNow = Hdom + 0.02; ztipNow = zshNow - Lpin; thetaNow = 0.;
+xNozNow  = xCSa; yNozNow = -0.5*Wband; zNozNow = HzCu + standoff;
+xProbe   = xNozNow; yProbe = yNozNow; zProbe = HzCu - 0.5*dzS;
+SAVEFRAME(tGlob, phaseLabel)
+
+dt = dtCS;
+phaseLabel = "COLD_SPRAY";
+
+for (int il=0; il<Nlayer; il++) {
+    for (int ip=0; ip<Npass; ip++) {
+
+        real yP = -0.5*Wband + ip*hatch + (il%2)*0.5*hatch;   // stagger alternate layers
+        int sgn = 1;
+        if ((il*Npass + ip)%2 == 1) sgn = -1;                 // zig-zag raster
+
+        for (int isub=0; isub<NsubCS; isub++) {
+
+            real xa, xb;
+            if (sgn > 0) { xa = xCSa + isub*Lseg; xb = xa + Lseg; }
+            else         { xb = xCSb - isub*Lseg; xa = xb - Lseg; }
+
+            gJet = exp(-(y-yP)^2/(2.*sigSpot^2)) * sqrt(2.*pi)*sigSpot/Lseg
+                 * 0.5*( erf((x-xa)/(sqrt(2.)*sigSpot)) - erf((x-xb)/(sqrt(2.)*sigSpot)) );
+
+            // grow the coating
+            aOld  = alpha;
+            hdep  = hdep + mdotVol/(2.*pi*sigSpot^2)*gJet*dtCS;
+            zs    = HzCu + hdep;
+            alpha = min(1., max(0., (zs - z)/dzS + 1.));
+
+            // newly deposited material arrives at particle temperature
+            Temp0 = Temp0 + max(0., alpha - aOld)*(Tpart - Temp0);
+
+            // heat: particle impact energy + gas jet, in the top solid node layer
+            sband   = (z <= zs + 1.e-9)*(z > zs - dzS)/dzS;
+            Tsource = PpartCS/(2.*pi*sigSpot^2)*gJet*sband;
+            hJv     = hJet0*gJet*sband;
+
+            UPDATEPROPS(alpha, phi, poro)
+
+            matrix MT = aTh(Sh,Sh);
+            real[int] fT = lTh(0,Sh);
+            set(MT, solver=UMFPACK);
+            Temp[] = MT^-1*fT;
+            Temp  = min(max(Temp, Tamb), Tmelt);
+            Temp0 = Temp;
+
+            tGlob += dtCS;
+
+            if (sgn > 0) xNozNow = xb; else xNozNow = xa;
+            yNozNow = yP;
+            real hN = hdep(min(max(xNozNow,-Lx+1.e-3),Lx-1.e-3), yP, HzCu);
+            zNozNow = HzCu + hN + standoff;
+            xProbe = xNozNow; yProbe = yP; zProbe = HzCu + hN - 0.5*dzS;
+
+            if (isub == NsubCS-1) SAVEFRAME(tGlob, phaseLabel)
+        }
+    }
+}
+
+// ============================================================
+// STAGE B : DWELL (cooling between CS and FSP)
+// ============================================================
+phaseLabel = "DWELL";
+Tsource = 0.;  hJv = 0.;
+dt = tDwell/NstepDwell;
+xNozNow = -Lx; yNozNow = 0.; zNozNow = Hdom + 0.06;      // park nozzle
+
+for (int k=1; k<=NstepDwell; k++) {
+    matrix MT = aTh(Sh,Sh);
+    real[int] fT = lTh(0,Sh);
+    set(MT, solver=UMFPACK);
+    Temp[] = MT^-1*fT;
+    Temp  = min(max(Temp, Tamb), Tmelt);
+    Temp0 = Temp;
+    tGlob += dt;
+    xProbe = 0.; yProbe = 0.; zProbe = HzCu + hdep(0.,0.,HzCu) - 0.5*dzS;
+    SAVEFRAME(tGlob, phaseLabel)
+}
+
+// ============================================================
+// FSP SET-UP FROM THE REAL AS-SPRAYED COATING
+// ============================================================
+real hMean = 0.;
+int  Nsmp  = 30;
+for (int i=0; i<Nsmp; i++) {
+    real xs = xStart + (xEnd - xStart)*i/(Nsmp - 1.);
+    hMean += hdep(xs, 0., HzCu);
+}
+hMean /= Nsmp;
+
+zTop      = HzCu + hMean;
+Lpin      = min(hMean + dPinSub, zTop - dShPlunge - 3.e-4);   // keep tip off the anvil
+stroke    = Lpin + dShPlunge;
+tPlunge   = stroke/vPlunge;
+tTraverse = (xEnd - xStart)/vFeed;
+tLift     = stroke/vLift;
+TtotFSP   = tPlunge + tTraverse + tLift;
+
+real Psh = deltaFric*muFric*sigmaNnom*omegaTool*(2.*pi/3.)*(Rsh^3 - Rpin^3);
+
+cout << "==========================================" << endl;
+cout << " Mean coating on FSP track: " << hMean*1000. << " mm" << endl;
+cout << " Pin length used: " << Lpin*1000. << " mm  (tip "
+     << dPinSub*1000. << " mm into Cu)" << endl;
+cout << " Shoulder power ~ " << Psh << " W" << endl;
+cout << " FSP: tPlunge=" << tPlunge << "  tTraverse=" << tTraverse
+     << "  tLift=" << tLift << " s" << endl;
+cout << "==========================================" << endl;
+
+// ============================================================
+// STAGE C : FRICTION STIR PROCESSING
+// ============================================================
+real tFSP0 = tGlob;
+real dtF   = TtotFSP/NstepFSP;
+dt = dtF;
+
+for (int step=1; step<=NstepFSP; step++) {
+
+    real tf = step*dtF;
+    tGlob   = tFSP0 + tf;
+
+    xToolNow = xToolF(tf);
+    ztipNow  = ztipF(tf);
+    zshNow   = ztipNow + Lpin;
+    thetaNow = omegaTool*tf;
+
+    if (tf <= tPlunge) {
+        phaseLabel = "FSP_PLUNGE";   vzTool = -vPlunge; vxTool = 0.;
+    } else if (tf <= tPlunge + tTraverse) {
+        phaseLabel = "FSP_TRAVERSE"; vzTool = 0.;       vxTool = vFeed;
+    } else {
+        phaseLabel = "FSP_LIFT";     vzTool = vLift;    vxTool = 0.;
+    }
+
+    // --- viscosity: Norton-Hoff in metal (Al/Cu mix), soft void ---
+    etaEff = alpha*min(etaMax, max(etaMin,
+                 Kmat(Temp0, phi)/(2.*strainRateMag(ux0,uy0,uz0)^(1.-mNh) + epsReg)))
+           + (1.-alpha)*etaVoid;
+
+    // --- tool as penalised rigid body: pin + shoulder ---
+    chiT = (sqrt((x-xToolNow)^2+y^2) <= Rpen)*(z >= ztipNow)*(z <= zshNow)
+         + (sqrt((x-xToolNow)^2+y^2) <= Rsh )*(z >  zshNow);
+    chiT = min(chiT, 1.);
+    uxT  = -omegaTool*y + vxTool;
+    uyT  =  omegaTool*(x - xToolNow);
+    uzT  =  vzTool;
+
+    // --- frictional heat, energy-normalised on the mesh, only where metal ---
+    real active = 0.;
+    if (tf <= tPlunge + tTraverse) active = 1.;
+
+    shW = alpha*sqrt((x-xToolNow)^2+y^2)
+        * (sqrt((x-xToolNow)^2+y^2) <= Rsh)
+        * (z >= zshNow - dzS)*(z <= zshNow + 1.e-9);
+    pinW = alpha*(sqrt((x-xToolNow)^2+y^2) <= Rpin + drS)
+         * (z >= ztipNow - dzS)*(z <= zshNow);
+
+    real ish     = int3d(Th)(shW);
+    real ipn     = int3d(Th)(pinW);
+    real ishFull = (2.*pi/3.)*Rsh^3*dzS;
+    real cSh     = Psh/max(ish, ishFull);        // partial contact -> partial power
+    real Limm    = max(0., min(zshNow, zTop) - ztipNow);
+    real Ppin    = deltaFric*muFric*sigmaNnom*omegaTool*Rpin*2.*pi*Rpin*Limm;
+    real cPin    = 0.;
+    if (ipn > 1.e-15) cPin = Ppin/ipn;
+
+    Tsource = active*(cSh*shW + cPin*pinW)
+            + alpha*(1.-chiT)*2.*etaEff*strainRateMag(ux0,uy0,uz0)^2;
+
+    // --- Stokes ---
+    matrix AS = aStokes(Xh,Xh);
+    real[int] bS = lStokes(0,Xh);
+    set(AS, solver=UMFPACK);
+    ux[] = AS^-1*bS;
+
+    // --- thermal ---
+    matrix MT = aTh(Sh,Sh);
+    real[int] fT = lTh(0,Sh);
+    set(MT, solver=UMFPACK);
+    Temp[] = MT^-1*fT;
+    Temp = min(max(Temp, Tamb), Tmelt);
+
+    // --- advect material state ---
+    matrix MV = aAdv(Sh,Sh);
+    set(MV, solver=UMFPACK);
+    ADVECT(alpha)
+    ADVECT(phi)
+    ADVECT(poro)
+    ADVECT(epsAcc)
+    alpha  = min(max(alpha, 0.), 1.);
+    phi    = min(max(phi,   0.), 1.);
+    poro   = min(max(poro,  0.), poro0);
+    epsAcc = max(epsAcc, 0.);
+
+    // --- FSP closes cold-spray porosity, accumulates strain ---
+    edotF  = strainRateMag(ux,uy,uz);
+    poro   = poro*exp(-Cden*alpha*edotF*dt);
+    epsAcc = epsAcc + alpha*edotF*dt;
+
+    UPDATEPROPS(alpha, phi, poro)
+
+    ux0[] = ux[];
+    Temp0 = Temp;
+
+    // --- output ---
+    if (step%Nsave == 0 || step == NstepFSP) {
+        xProbe = xToolNow; yProbe = 0.5*Rsh; zProbe = zshNow - 0.5*dzS;
+        real xpS = min(max(xProbe, -Lx+1.e-3), Lx-1.e-3);
+        real zpS = min(max(zProbe, 1.e-4), Hdom-1.e-4);
+        real Tt  = Temp(xpS, yProbe, zpS);
+        real pht = phi(xpS, yProbe, zpS);
+        real edotC = omegaTool*Rsh/max(zshNow - ztipNow, 1.e-4);
+        FzNow = 0.;
+        if (zshNow <= zTop + dzS) FzNow = Kmat(Tt, pht)*edotC^mNh*pi*Rsh^2;
+        TqNow = muFric*FzNow*(2./3.)*Rsh;
+        SAVEFRAME(tGlob, phaseLabel)
+    }
+}
+
+{
+    ofstream pv(outdir+"fsam.pvd", append);
+    pv << "</Collection></VTKFile>" << endl;
+}
+
+cout << "==========================================" << endl;
+cout << " DONE: " << outdir << "fsam.pvd" << endl;
+cout << " Threshold SolidFrac > 0.5 to see the metal (coating + substrate)" << endl;
+cout << " AlFrac: 1 Al coating, 0 Cu substrate, between = stirred Al-Cu" << endl;
+cout << " Porosity: as-sprayed " << poro0 << " -> closed in the stir zone" << endl;
+cout << " CoatThick: as-sprayed thickness map from the CS stage" << endl;
+cout << "==========================================" << endl;
